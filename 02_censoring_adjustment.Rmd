@@ -1,0 +1,923 @@
+---
+title: "Censoring Adjustment and Survival Prediction for Under-Five Mortality"
+output: html_document
+date: "2026-01-21"
+---
+
+# DHS data Preparation and Censoring Adjustment
+
+This section implements a survival-based censoring adjustment framework for under-five mortality estimation using Demographic and Health Survey (DHS) birth histories. The primary objective is not direct mortality estimation, but the prediction of survival outcomes for children who were alive at the time of survey but had not yet reached the full risk period of five years (0–59 months).
+
+In standard DHS surveys, child survival status is observed only up to the interview date. As a result, children aged 0–4 years are right-censored, and their eventual survival outcome (death before age 5 or survival beyond 5 years) is not fully observed. This can lead to systematic underestimation of under-five mortality when relying on observed deaths only.
+
+To address this limitation, this pipeline constructs a unified survival framework that:
+
+Harmonizes DHS birth history variables and resolves inconsistencies in reported child age and survival status
+Constructs a consistent time-to-event representation (age in months up to 60 months)
+Applies multiple survival learning approaches (Cox proportional hazards, Random Survival Forest, and Gradient Boosting survival models)
+Estimates individual-level survival probabilities up to age 60 months
+Generates predicted risk of death for children who are currently censored (alive but not yet 5 years old)
+
+The resulting outputs are probabilistic survival estimates, not observed outcomes. These predictions are later used as inputs to spatially explicit Bayesian models (INLA with SPDE) for small-area estimation of under-five mortality.
+
+All data processing steps are designed to ensure reproducibility and compatibility with DHS-style birth history data, including handling of missing age information, censoring rules, and survey design constraints.
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Core Data Processing
+library(haven)        # Read DHS .dta files
+library(dplyr)        # Data manipulation
+library(tidyr)        # Data reshaping
+library(purrr)        # Functional programming
+library(jsonlite)     # JSON export
+library(writexl)      # Excel export
+# Spatial Data Processing
+library(terra)        # Raster processing
+library(sf)           # Vector spatial data
+library(exactextractr) # Raster extraction over polygons
+# Statistical & Survival Analysis
+library(survival)         # Survival models (Cox)
+library(randomForestSRC)  # Random Survival Forest
+library(gbm)              # Gradient boosting
+library(pec)              # Prediction error curves
+library(Hmisc)            # C-index (rcorr.cens)
+library(survivalROC)
+# Diagnostics & Statistics
+library(moments)      # Skewness, kurtosis
+library(e1071)        # Additional skewness/kurtosis
+library(car)          # VIF (multicollinearity)
+library(corrr)        # Correlation analysis
+# ROC & Model Evaluation
+library(pROC)         # ROC curves
+library(timeROC)      # Time-dependent ROC
+# Visualization
+library(ggplot2)      # Plotting
+library(corrplot)     # Correlation plots
+# Bayesian Spatial Modeling
+library(INLA)         # Bayesian inference
+library(fmesher)      # Mesh construction for INLA
+# Reproducibility
+set.seed(123)
+```
+
+
+## DATA PREPARATION & HARMONIZATION 
+
+### Handling Missing Child Age and Constructing Survival Time Variable
+
+This step prepares the child-level survival time variable required for subsequent under-five mortality modeling. The dataset used in this study is a **synthetic DHS-like dataset (synthetic_dhs_200k.rds)** generated for methodological development and reproducibility. The original DHS microdata cannot be shared due to data use restrictions.
+
+The objective of this step is to construct a consistent and complete measure of child age in months (b19), which is essential for survival analysis and censoring adjustment.
+
+DHS birth history variables are harmonized and converted into numeric format. Missing values in child age are then systematically imputed using two hierarchical sources:
+
+1. For surviving children, age in months is derived from reported age in years (b8 × 12).  
+2. For remaining missing cases, age at death in months (b7) is used as a secondary source.
+
+After this procedure, the variable **b19 represents the best available estimate of child age in months**, combining information from both surviving and deceased children. This ensures consistency in defining survival time and enables later construction of censoring-adjusted survival models.
+
+```{r 1}
+
+#data <- readRDS(synthetic_dhs_200k.rds)
+data$b8 <- as.numeric(as.character(data$b8))
+data$b7 <- as.numeric(as.character(data$b7))
+data$b19 <- as.numeric(as.character(data$b19))
+data$b5 <- as.numeric(as.character(data$b5))
+data$b2 <- as.numeric(as.character(data$b2))
+data$b1 <- as.numeric(as.character(data$b1))
+missing_b19 <- is.na(data$b19)
+
+# First imputation: from b8 (age in years for surviving children)
+data$b19[missing_b19] <- data$b8[missing_b19] * 12
+
+# Second imputation: from b7 (age at death for deceased children)
+# Recalculate which are STILL missing after first imputation
+still_missing <- is.na(data$b19)
+data$b19[still_missing] <- data$b7[still_missing]
+```
+
+### Conversion from Ethiopian Calendar to Gregorian Birth Year
+
+To ensure temporal consistency across covariates and survival outcomes, child birth dates are converted from the Ethiopian calendar system to the Gregorian calendar.
+
+The DHS data used in this study reports birth information in Ethiopian calendar format, where:
+- b2 represents the birth year
+- b1 represents the birth month (1–12)
+
+Because the Ethiopian calendar differs from the Gregorian calendar by approximately 7–8 years depending on the month of birth, a rule-based conversion is applied:
+
+- Births occurring in months 1–4 (September–December) are converted using: Gregorian year = Ethiopian year + 8  
+- Births occurring in months 5–12 (January–August) are converted using: Gregorian year = Ethiopian year + 7  
+
+The resulting variable (gc_birth_year) provides a harmonized Gregorian birth year used for all subsequent temporal alignment, clustering, and survival modeling.
+
+If applied to non-Ethiopian datasets, this step should be omitted or replaced with an appropriate calendar conversion specific to the study context.
+
+```{r 2}
+# Convert Ethiopian calendar to Gregorian birth year
+eth_to_gc_year <- function(b2, b1) {
+  gc_year <- ifelse(b1 >= 1 & b1 <= 4,
+                    b2 + 8,
+                    b2 + 7)
+  return(gc_year)
+}
+data$gc_birth_year <- eth_to_gc_year(data$b2, data$b1)
+```
+
+### Recoding of Child Mortality Outcome for Survival Analysis
+
+The DHS variable b5 encodes child survival status using a reverse coding scheme, where:
+- b5 = 1 indicates the child is alive at the time of survey
+- b5 = 0 indicates the child has died
+
+For survival analysis, this coding is inverted to align with standard event definitions, where:
+- event = 1 corresponds to death (failure event)
+- event = 0 corresponds to survival or censoring
+
+This transformation ensures compatibility with survival models such as Cox proportional hazards, Random Survival Forest, and Gradient Boosting survival models, all of which require a binary event indicator where 1 represents the occurrence of the event of interest.
+
+After recoding, the variable b5 is used consistently as the event indicator in subsequent survival modeling steps.
+
+```{r 3}
+# Recode mortality outcome for survival analysis
+table(data$b5)
+data$b5 <- ifelse(data$b5 == 0, 1,
+                  ifelse(data$b5 == 1, 0, data$b5))
+table(data$b5)
+```
+
+### Subsetting Analysis Period and Preparing Year-Specific DHS Dataset
+
+To ensure computational feasibility and reproducibility, the analysis is conducted on a **year-by-year basis** rather than processing all survey years simultaneously. This approach avoids memory limitations associated with large DHS datasets and high-resolution spatial covariates.
+
+The dataset is first restricted to observations from the year 2000 onward. For each iteration of the workflow, a single birth year is selected and processed independently. The same pipeline is then repeated for subsequent years (e.g., 2001, 2002, …), ensuring consistency across all temporal subsets.
+
+A subset of relevant DHS variables is retained for survival analysis and spatial linkage. These include:
+- child characteristics (e.g., sex, birth order)
+- household variables (e.g., residence, wealth index)
+- survival variables (e.g., age at death, age in months, survival status)
+- geographic coordinates for spatial covariate extraction
+
+Basic missing data diagnostics are performed to identify variables requiring imputation or further preprocessing in subsequent steps.
+
+This modular structure supports scalable processing while maintaining a consistent analytical framework across years.
+
+```{r 4}
+# Restrict dataset to analysis period (year >= 2000)
+data <- data[data$gc_birth_year >= 2000, ]
+# Keep only required DHS variables for survival and spatial analysis
+DHS_data <- data[, c("b4", "v025", "v190", "v201", "b0", "b5", "b6", "b7", "b8", "b19", "dhsregna", "latnum", "longnum", "gc_birth_year")]
+# Check missing values
+na_counts <- colSums(is.na(DHS_data))
+print(na_counts[na_counts > 0])
+```
+
+### Imputation of Missing Household Wealth Index
+
+The household wealth index (v190) is a key socioeconomic covariate in under-five mortality analysis, but contains missing values in the dataset. To ensure completeness and avoid loss of observations, missing values are imputed using a median-based approach.
+
+Imputation is performed **within each birth year (gc_birth_year)** to preserve temporal consistency and account for potential changes in wealth distribution over time. The median is chosen as a robust measure that is less sensitive to skewness and outliers, which are common in wealth-related variables.
+
+This approach ensures that:
+- all observations are retained for downstream modeling  
+- the imputed values remain consistent with the year-specific distribution of wealth  
+- bias due to systematic missingness is minimized  
+
+After imputation, the dataset is checked to confirm that no missing values remain in the wealth variable.
+
+```{r 5}
+# Impute missing household wealth index (year-specific median)
+DHS_data$v190<-as.numeric(DHS_data$v190)
+DHS_data <- DHS_data %>%
+  group_by(gc_birth_year) %>%
+  mutate(v190 = ifelse(is.na(v190), median(v190, na.rm = TRUE), v190)) %>% ungroup()
+# Check remaining missing values
+na_counts <- colSums(is.na(DHS_data))
+print(na_counts[na_counts > 0])
+```
+
+### Alignment of Survival Status with Under-Five Risk Definition
+
+This step ensures consistency between child survival status and age at death (or age at observation), aligning the dataset with the definition of under-five mortality (death before 60 months).
+
+First, the original survival status variable (b5) is preserved (b5_ori) to retain the raw DHS coding for reference and validation.
+
+Children with reported age greater than 59 months are treated as having survived the under-five risk period. Since the analytical focus is restricted to mortality before age five, these observations are recoded as non-events (alive) within the survival framework, regardless of their original status.
+
+For observations with missing age information (b7), a value greater than the under-five threshold (61 months) is assigned. This ensures that such cases are excluded from the under-five risk set without being removed from the dataset, thereby preserving sample size and avoiding selection bias.
+
+Finally, consistency checks are applied to guarantee that no missing values remain in key survival variables (b5 and b7). This step is critical for ensuring that downstream survival models operate on a fully defined time-to-event structure.
+
+Overall, this preprocessing step enforces a coherent definition of the risk period, avoids misclassification of events, and ensures compatibility with censoring-adjusted survival analysis.
+
+```{r 6}
+# Preserve original survival status
+DHS_data$b5_ori<-DHS_data$b5
+# Recode children older than 59 months as non-events
+over_59 <- which(!is.na(DHS_data$b7) & DHS_data$b7 > 59)
+if (length(over_59) > 0) {
+  DHS_data$b5[over_59] <- 0
+}
+# Assign age >60 months for missing age values
+if (any(is.na(DHS_data$b7))) {
+  DHS_data$b7[is.na(DHS_data$b7)] <- 61
+}
+# Ensure no missing values remain
+stopifnot(sum(is.na(DHS_data$b5)) == 0)
+stopifnot(sum(is.na(DHS_data$b7)) == 0)
+# Inspect distribution
+table(data$b5)
+table(DHS_data$b5)
+```
+
+### Annual Sample Size and Mortality Summary
+
+To assess data consistency and verify the impact of preprocessing and censoring adjustments, annual summaries of sample size and mortality counts are generated.
+
+The number of child observations is first tabulated by Gregorian birth year (gc_birth_year). Mortality counts are then computed using two definitions:
+
+- Adjusted mortality (b5): reflects deaths within the under-five risk framework after applying censoring rules  
+- Original mortality (b5_ori): reflects deaths at any reported age prior to censoring adjustment  
+
+Comparing these two measures provides a diagnostic check on how the censoring and age-alignment steps affect mortality counts across years.
+
+The resulting summary table includes:
+- total number of observations per year  
+- number of deaths under the adjusted survival definition  
+- number of deaths based on original DHS coding  
+
+This step improves transparency and helps ensure that the preprocessing pipeline produces consistent and expected patterns before proceeding to survival modeling.
+
+```{r 7}
+# Annual sample size and mortality summaries
+year_counts <- table(DHS_data$gc_birth_year)
+death_counts <- tapply(DHS_data$b5, DHS_data$gc_birth_year, sum, na.rm = TRUE)
+death_counts_U5 <- tapply(DHS_data$b5_ori, DHS_data$gc_birth_year, sum, na.rm = TRUE)
+samples_table <- data.frame(
+  year = as.numeric(names(year_counts)),
+  n_samples = as.vector(year_counts),
+  n_deaths_any_age = as.vector(death_counts[names(year_counts)]),
+   n_deaths_censor = as.vector(death_counts_U5[names(year_counts)])
+)
+print(samples_table)
+samples_table <- DHS_data %>%
+  group_by(gc_birth_year) %>%
+  summarise(
+    n_samples = n(),
+    n_deaths_adjusted = sum(b5, na.rm = TRUE),
+    n_deaths_original = sum(b5_ori, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+##  SPATIAL COVARIATE PROCESSING
+
+### Spatial Covariates: Preprocessed Raster Data (Year 2000 Example)
+
+This step loads spatial covariates used for censoring adjustment and mortality risk prediction. The raster datasets are not raw downloads; they are preprocessed and shared via Zenodo for reproducibility.
+
+All raster layers have been:
+- Resampled to a common 5 km spatial resolution  
+- Aligned to a consistent Ethiopia analysis grid  
+- Standardized using z-score transformation  
+- Transformed where necessary (e.g., log-scaling and capping)  
+
+These preprocessing steps ensure comparability across covariates and improve model stability.
+
+The covariates represent environmental, health, and socioeconomic conditions relevant to under-five mortality. The example below shows year 2000; the same process is repeated for other years.
+
+```{r 8}
+deareha_2000 <-rast("ethiopia_deareaha_2007_5km_zscore.tif")
+dewpoint_temp_2m_2000<-rast("ethiopia_dewpoint_temp_2m_2007_5km_zscore.tif")
+DPT3_2000<-rast("ethiopia_dpt3_2007_5km_zscore.tif")
+Education_2000<- rast("ethiopia_education_2007_5km_zscore.tif")
+LRI_2000 <- rast("ethiopia_lri_2007_5km_zscore.tif")
+Slope_2000 <- rast("ethiopia_slope_5km_zscore.tif")
+Stunting_2000 <- rast("ethiopia_stunting_2007_5km_zscore.tif")
+HIV_2000 <- rast("ethiopia_hiv_2007_5km_zscore.tif")
+malaria_2000 <- rast("ethiopia_malaria_2007_5km_zlog.tif")
+NDVI_2000<- rast("ethiopia_ndvi_2007_5km_zscore.tif")
+Night_time_light_2000<- rast("ethiopia_nighttime_light_2007_5km_binary.tif")
+PM2.5_2000<- rast("ethiopia_pm2_5_2007_5km_zscore.tif")
+potentialevaporation_2000<- rast("ethiopia_potential_evaporation_2007_5km_zscore.tif")
+runoff_2000<- rast("ethiopia_runoff_2007_5km_zscore.tif")
+Severe_Wasting_2000<- rast("ethiopia_severe_wasting_2007_5km_zlog.tif")
+solarradiationdown_2000<- rast("ethiopia_solar_radiation_2007_5km_zscore.tif")
+WASH_2000<- rast("ethiopia_wash_2007_5km_zlog.tif")
+Water_2000<- rast("ethiopia_water_2007_5km_zscore.tif")
+```
+
+### Extraction of Spatial Covariates at DHS Locations
+
+This step links DHS observations with spatial covariates using geographic coordinates. DHS cluster locations (longitude and latitude) are converted into spatial points, allowing integration with raster datasets.
+
+All covariates for the selected year (2000) are combined into a single raster stack to ensure consistent and efficient extraction. Raster values are then extracted at each DHS location and appended to the DHS dataset.
+
+The resulting dataset contains both child-level survey variables and corresponding spatial predictors. Missing values from the extraction process are identified and handled in subsequent steps.
+
+```{r 9}
+DHS_data<-subset(DHS_data, gc_birth_year==2000)
+# Convert DHS data to spatial points and extract raster covariates
+dhs_points <- vect(DHS_data, geom = c("longnum", "latnum"), crs = "EPSG:4326")
+covariates_stack <- c(deareha_2000, dewpoint_temp_2m_2000, DPT3_2000, Education_2000, LRI_2000, Slope_2000, Stunting_2000, HIV_2000, malaria_2000,  NDVI_2000, Night_time_light_2000, PM2.5_2000, potentialevaporation_2000, runoff_2000, Severe_Wasting_2000, solarradiationdown_2000, WASH_2000, Water_2000)
+names(covariates_stack) <- c("deareha", "dewpoint", "DPT3", "Education", "LRI", "Slope", "Stunting", "HIV", "malaria", "NDVI", "Night_lights", "PM2.5", "evaporation", "runoff", "Wasting", "solar", "WASH", "Water")
+extracted_values <- terra::extract(covariates_stack, dhs_points)
+extracted_values <- extracted_values[, -1]
+DHS_data_with_covariates <- cbind(DHS_data, extracted_values)
+colSums(is.na(DHS_data_with_covariates[, names(covariates_stack)]))
+```
+
+### Handling Missing Values in Spatial Covariates
+
+Missing values in the extracted spatial covariates are addressed through imputation. Since all continuous covariates were previously standardized using z-score transformation, a value of 0 represents the mean of each variable. Therefore, imputing missing values with 0 is equivalent to replacing them with the average condition, which is a common and appropriate approach for standardized variables.
+
+For the night-time lights variable (binary), missing values are imputed with 0, indicating absence of detected light.
+
+After imputation, all covariates are checked to ensure that no missing values remain. This step ensures a complete dataset suitable for survival modelling and machine learning algorithms, which typically require fully observed inputs.
+
+```{r 10}
+# Impute missing z-score covariates with 0 (mean value)
+zscore_covariates <- c("deareha", "dewpoint", "DPT3", "Education", "LRI",  "Slope", "Stunting", "HIV", "malaria", "NDVI", "PM2.5", "evaporation", "runoff", "Wasting", "solar", "WASH", "Water")
+for(cov in zscore_covariates) {
+  DHS_data_with_covariates[[cov]][is.na(DHS_data_with_covariates[[cov]])] <- 0
+}
+if("Night_lights" %in% names(DHS_data_with_covariates)) {
+  DHS_data_with_covariates$Night_lights[is.na(DHS_data_with_covariates$Night_lights)] <- 0
+}
+all_covariates <- c(zscore_covariates, "Night_lights")
+na_counts <- colSums(is.na(DHS_data_with_covariates[, all_covariates]))
+cat("Remaining NAs:", sum(na_counts), "\n")
+
+if(sum(na_counts) == 0) {
+  cat("All missing values imputed with 0\n")
+}
+DHS_cov_2000<-DHS_data_with_covariates
+```
+
+### Retaining Geographic Coordinates for Spatial Modelling
+
+In this step, the geographic coordinates (longitude and latitude) are extracted and stored separately from the main dataset. These coordinates are preserved to enable reattachment after censoring adjustment and model-based predictions.
+
+This is essential for subsequent spatial analysis using INLA with the SPDE approach, where precise location information is required to construct spatial meshes and perform geostatistical modelling.
+
+Maintaining a separate location object ensures that spatial coordinates remain unchanged and can be consistently merged back with the processed dataset, linking predicted outcomes with spatial covariates for final modelling.
+
+```{r 11}
+# Store geographic coordinates for later spatial merging (INLA-SPDE)
+location<-select(DHS_cov_2000, longnum ,latnum)
+```
+
+### Missing Data Assessment After Covariate Construction
+
+After constructing the full dataset with extracted and imputed covariates, a final check is performed to identify any remaining missing values.
+
+This step ensures data completeness before moving to survival modelling and spatial censoring adjustment. Identifying residual missingness at this stage helps verify that earlier imputation and extraction steps were successful and that the dataset is ready for downstream analysis.
+
+```{r 12}
+# Check remaining missing values in the final covariate dataset
+na_counts <- colSums(is.na(DHS_cov_2000))
+print(na_counts[na_counts > 0])
+```
+
+### Construction of the Final Analysis Dataset
+
+In this step, the final set of variables used for survival and spatial censoring analysis is defined. The selection includes:
+
+- Outcome variables (death status and survival time)
+- Key demographic and socioeconomic covariates
+- Environmental and health-related spatial predictors
+
+To ensure robustness and reproducibility, only variables that are present in the dataset are retained. This prevents errors caused by missing or mismatched columns after raster extraction and preprocessing.
+
+The resulting dataset forms the final input for survival models (Cox, RSF, GBM) and spatial adjustment using INLA-SPDE.
+
+```{r 13}
+# Define final variables for survival and spatial modelling
+model_vars <- c(
+  "b5", "b19",          
+  "b7",           
+  "v025",         
+  "v190",        
+  "b4",   
+  "b0",          
+ "deareha", "dewpoint", "DPT3", "Education", "LRI",  "Slope", "Stunting", "HIV", "malaria", "NDVI",           "Night_lights", "PM2.5", "evaporation", "runoff",     "Wasting", "solar", "WASH", "Water"  
+)
+keep_vars <- intersect(model_vars, names(DHS_cov_2000))
+DHS_model <- DHS_cov_2000[, keep_vars]
+```
+
+
+##  SURVIVAL DATA CONSTRUCTION
+
+### Construction of Survival Time and Event Variables
+
+This step defines the survival outcome structure required for censoring-adjusted under-five mortality analysis.
+
+Child survival time is constructed in months using reported age at death or age at survey. For children who died, age at death is used directly. For children who are alive at the time of survey, survival time is censored at either their current age or at 60 months (5 years), depending on whether they have reached the under-five threshold.
+
+An event indicator is also created, where deaths occurring before 60 months are coded as events, while all other cases are treated as censored observations.
+
+This formulation ensures a consistent survival framework for all children, enabling the application of Cox proportional hazards, random survival forest, and gradient boosting survival models, as well as subsequent spatial adjustment using INLA-SPDE.
+
+```{r 14}
+# Construct survival time (months) and event indicator for under-five mortality
+DHS_model <- DHS_model %>%
+  mutate(
+    time = case_when(
+      b5 == 1 ~ b7,       
+      b5 == 0 & b19 >= 60 ~ 60, 
+      b5 == 0 & b19 < 60 ~ b19,  
+      TRUE ~ NA_real_
+    ),  
+    event = case_when(
+      b5 == 1 & b7 < 60 ~ 1,   
+      b5 == 1 & b7 >= 60 ~ 0,  
+      b5 == 0 ~ 0,            
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(time), !is.na(event))
+surv_obj <- Surv(time = DHS_model$time, event = DHS_model$event)
+```
+
+### Simplified Survival Object Construction (Exploratory Model)
+
+For comparison and preliminary model fitting, a simplified survival object is also constructed using age at death (`b7`) and the original survival indicator (`b5`).
+
+In this formulation, age at death is used directly as the survival time for deceased children, while survival status is used as the event indicator. This approach does not apply additional censoring rules and is therefore used only for exploratory or baseline comparisons.
+
+The final censoring-adjusted survival framework used for main analysis is defined separately in the main modelling section.
+
+```{r 15}
+# Simplified survival object (exploratory comparison only)
+  surv_obj <- Surv(time = DHS_model$b7, event = DHS_model$b5)
+```
+
+
+##   MODEL FITTING & PREDICTION 
+
+### Cox Proportional Hazards Model and Survival Prediction
+
+A Cox proportional hazards model is fitted to estimate the effect of demographic, socioeconomic, and spatial covariates on child survival time. The model uses the constructed survival object and includes both individual-level DHS variables and environmental raster-derived covariates.
+
+Survival probabilities are then predicted for each child at 60 months (5 years), which is the standard threshold for under-five mortality analysis. These predicted survival probabilities represent the likelihood of a child surviving up to age five, conditional on observed covariates.
+
+To ensure valid predictions, only complete cases of covariates are used. The resulting survival probabilities are extracted from the fitted survival curves.
+
+Finally, a binary classification is generated using a threshold of 0.5, where values above the threshold indicate survival and values below indicate death risk.
+
+```{r 16}
+# Fit Cox proportional hazards model for survival prediction
+cox_model <- coxph(surv_obj ~ v025 + v190 + b4 + b0 + deareha + dewpoint + DPT3 + Education + LRI + Slope + Stunting + HIV + malaria + NDVI + Night_lights + PM2.5 + evaporation + runoff + Wasting + solar + WASH + Water, data=DHS_model, x = TRUE, y = TRUE)
+DHS_model$pred_cox_prob <- NA
+complete_idx <- complete.cases(DHS_model[, c("v025", "v190", "b4", "b0", "deareha", "dewpoint", "DPT3", "Education", "LRI", "Slope", "Stunting", "HIV", "malaria", "NDVI", "Night_lights", "PM2.5", "evaporation", "runoff", "Wasting", "solar", "WASH", "Water")])
+pred_cox <- survfit(cox_model, newdata = DHS_model[complete_idx, ])
+pred_list <- summary(pred_cox, times = 60)
+DHS_model$pred_cox_prob[complete_idx] <- sapply(pred_list$surv, function(x) x[1])
+threshold <- 0.5
+DHS_model$pred_cox_bin <- ifelse(DHS_model$pred_cox_prob >= threshold, 0, 1)
+```
+
+### Data Type Harmonization and Random Survival Forest Modelling
+
+Before fitting the Random Survival Forest (RSF) model, all covariates are standardized into appropriate data types to ensure correct model interpretation.
+
+Continuous environmental and health indicators (e.g., climate, disease burden, environmental exposure) are explicitly converted to numeric format, while categorical DHS variables (e.g., residence type, wealth index, child sex, and birth order) are converted to factors.
+
+This step is essential because RSF models are sensitive to variable types, and incorrect encoding can bias split selection and survival probability estimation.
+
+After preprocessing, a Random Survival Forest model is fitted using under-five survival time and event indicators. The model captures complex non-linear relationships and interactions between socioeconomic, demographic, and spatial environmental covariates.
+
+Survival probabilities are then predicted at 60 months (under-five threshold), and converted into binary survival risk classifications using a predefined decision threshold. 
+
+```{r 17}
+# Check variable classes
+sapply(DHS_model[, c("v025", "v190", "b4", "b0", "deareha", "dewpoint", "DPT3", "Education", "LRI", "Slope", "Stunting", "HIV", "malaria", "NDVI", "Night_lights", "PM2.5", "evaporation", "runoff", "Wasting", "solar", "WASH", "Water")], class)
+# Ensure all numeric covariates are actually numeric
+numeric_covars <- c("deareha", "dewpoint", "DPT3", "Education", "LRI", "Slope", "Stunting", "HIV", "malaria", "NDVI", "Night_lights", "PM2.5", "evaporation", "runoff", "Wasting", "solar", "WASH", "Water")
+
+for(cov in numeric_covars) {
+  DHS_model[[cov]] <- as.numeric(as.character(DHS_model[[cov]]))
+}
+# Ensure factors for categorical
+DHS_model$v025 <- as.factor(DHS_model$v025)
+DHS_model$v190 <- as.factor(DHS_model$v190)
+DHS_model$b4 <- as.factor(DHS_model$b4)
+DHS_model$b0 <- as.factor(DHS_model$b0)
+# Now run RSF
+set.seed(123)
+rsf_model <- rfsrc(Surv(b7, b5) ~ ., data = DHS_model[, c("b7", "b5", "v025", "v190", "b4", "b0", numeric_covars)], ntree = 500, importance = TRUE)
+rsf_pred <- predict(rsf_model, newdata = DHS_model)
+
+time_index <- which.min(abs(rsf_pred$time.interest - 60))
+DHS_model$pred_rsf_prob <- rsf_pred$survival[, time_index]
+threshold <- 0.5
+DHS_model$pred_rsf_bin <- ifelse(DHS_model$pred_rsf_prob >= threshold, 0, 1)
+```
+
+### Gradient Boosting Survival Model for Under-Five Mortality Risk Estimation
+
+A Gradient Boosting Machine (GBM) survival model is used to estimate non-linear effects of socioeconomic, demographic, and environmental covariates on under-five mortality risk.
+
+The model is specified under a Cox proportional hazards framework, allowing flexible estimation of the hazard function without requiring strict linear assumptions.
+
+To improve generalization and reduce overfitting, the dataset is split into training and testing subsets, and model tuning is guided by cross-validation to identify the optimal number of boosting iterations.
+
+Predicted risk scores are derived from the fitted model and then transformed into survival probabilities at 60 months using a Cox baseline hazard adjustment. This allows direct comparison with other survival models (Cox and RSF) within a unified probability scale.
+
+Finally, survival probabilities are converted into binary classifications using a fixed threshold, enabling downstream evaluation of predictive performance and comparison across models.
+
+```{r 18}
+# Fit gradient boosting survival model and estimate mortality risk.
+set.seed(123)
+gbm_model <- gbm(Surv(b7, b5) ~ v025 + v190 + b4 + b0 + deareha + dewpoint + DPT3 + Education + LRI + Slope + Stunting + HIV + malaria + NDVI + Night_lights + PM2.5 + evaporation + runoff + Wasting + solar + WASH + Water,
+                 distribution = "coxph",
+                 data = DHS_model,
+                 n.trees = 5000,
+                 interaction.depth = 3,
+                 shrinkage = 0.01,
+                 n.minobsinnode = 10,
+                 cv.folds = 5,
+                 verbose = TRUE)
+train_idx <- sample(seq_len(nrow(DHS_model)), 0.7 * nrow(DHS_model))
+train_data <- DHS_model[train_idx, ]
+test_data  <- DHS_model[-train_idx, ]
+# Determine best iteration from CV
+best_iter <- gbm.perf(gbm_model, method = "cv")
+# Predict risk scores
+risk_score <- predict(gbm_model, newdata = test_data, n.trees = best_iter, type = "link")
+test_data$risk_score <- risk_score
+cox_baseline <- coxph(Surv(b7, b5) ~ offset(risk_score), data = test_data)
+# Predict risk scores for DHS_model
+risk_score_all <- predict(gbm_model, newdata = DHS_model, n.trees = best_iter, type = "link")
+DHS_model$risk_score <- risk_score_all
+# Fit Cox model using DHS_model data
+cox_baseline <- coxph(Surv(b7, b5) ~ offset(risk_score), data = DHS_model)
+# Compute baseline survival at 60 months
+base_surv <- survfit(cox_baseline, newdata = data.frame(risk_score = 0))
+pred_time <- summary(base_surv, times = 60)$surv
+# Apply formula: S(t|X) = S0(t)^exp(risk_score)
+DHS_model$pred_gbm_prob <- pred_time ^ exp(risk_score_all)
+# Binary classification at threshold = 0.5
+threshold <- 0.5
+DHS_model$pred_gbm_bin <- ifelse(DHS_model$pred_gbm_prob >= threshold, 0, 1)
+```
+
+
+##  MODEL COMPARISON & SELECTION
+
+### Model Performance Evaluation and Selection for Censoring-Adjusted Survival Models
+
+This section evaluates and compares the predictive performance of three survival modelling approaches: Cox Proportional Hazards, Random Survival Forest (RSF), and Gradient Boosting Machine (GBM).
+
+Model evaluation is conducted using multiple complementary metrics to ensure robust comparison:
+
+- **Concordance Index (C-index)** to assess discriminatory ability
+- **Brier Score (Prediction Error)** to evaluate overall prediction accuracy over time
+- **Time-dependent ROC curves (AUC at 60 months)** to measure classification performance at the under-five threshold
+
+Only complete-case observations with valid survival predictions from all models are included in the evaluation to ensure fair comparison.
+
+The final step summarizes model performance across all metrics and identifies the best-performing model for downstream censoring adjustment and under-five mortality estimation.
+
+```{r 19}
+# COMPLETE MODEL COMPARISON - DEBUGGED VERSION
+# Fixes for NA AUC and missing ROC lines
+# CONCORDANCE INDEX (C-INDEX)
+# Calculate C-index for each model
+valid_idx <- complete.cases(DHS_model$pred_cox_prob, DHS_model$pred_rsf_prob, DHS_model$pred_gbm_prob, DHS_model$b7, DHS_model$b5)
+DHS_valid <- DHS_model[valid_idx, ]
+cindex_cox <- rcorr.cens(DHS_valid$pred_cox_prob, Surv(DHS_valid$b7, DHS_valid$b5))
+cindex_rsf <- rcorr.cens(DHS_valid$pred_rsf_prob, Surv(DHS_valid$b7, DHS_valid$b5))
+cindex_gbm <- rcorr.cens(DHS_valid$pred_gbm_prob, Surv(DHS_valid$b7, DHS_valid$b5))
+cindex_table <- data.frame(
+  Model = c("CoxPH", "RSF", "GBM"),
+  CIndex = c(
+    cindex_cox["C Index"],
+    cindex_rsf["C Index"],
+    cindex_gbm["C Index"]
+  )
+)
+print(cindex_table)
+a <- ggplot(cindex_table, aes(x = Model, y = CIndex, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = round(CIndex, 3)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("CoxPH" = "blue", "RSF" = "red", "GBM" = "green")) +
+  ylim(0, 1) +
+  labs(title = "A. Concordance Index", y = "C-index", x = "") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+print(a)
+# BRIER SCORE (PREDICTION ERROR)
+models_list <- list(
+  CoxPH = cox_model,
+  RSF = rsf_model
+)
+pec_results <- tryCatch({
+  pec(
+    object = models_list,
+    formula = Surv(b7, b5) ~ 1,
+    data = DHS_valid,
+    times = seq(0, 60, by = 12),
+    exact = FALSE,
+    cens.model = "marginal"
+  )
+}, error = function(e) {
+  print("PEC error, using simplified approach")
+  NULL
+})
+if(!is.null(pec_results)) {
+  brier_table <- data.frame(
+    Model = c("Reference (KM)", "CoxPH", "RSF"),
+    Brier_60months = c(
+      pec_results$AppErr$Reference[which(pec_results$time == 60)],
+      pec_results$AppErr$CoxPH[which(pec_results$time == 60)],
+      pec_results$AppErr$RSF[which(pec_results$time == 60)]
+    )
+  )
+  print(brier_table)
+   plot(pec_results,
+       xlab = "Time (months)",
+       ylab = "Prediction Error (Brier Score)",
+       col = c("black", "blue", "red"),
+       lty = 1:3,
+       lwd = 2,
+       legend = TRUE,
+       legend.x = "topright")
+  
+  title(main = "B. Brier Score (Prediction Error)", adj = 0)
+}
+# TIME-DEPENDENT ROC
+roc_data <- DHS_valid %>%
+  mutate(
+    roc_time = pmin(b7, 60),
+    roc_event = case_when(
+      b5 == 1 & b7 < 60 ~ 1,
+      TRUE ~ 0
+    )
+  )
+if(sum(roc_data$roc_event == 1) >= 10) {
+  surv_roc_cox <- survivalROC(
+    Stime = roc_data$roc_time,
+    status = roc_data$roc_event,
+    marker = 1 - roc_data$pred_cox_prob,
+    predict.time = 60,
+    method = "NNE",
+    span = 0.25 * nrow(roc_data)^(-0.20)
+  )
+  surv_roc_rsf <- survivalROC(
+    Stime = roc_data$roc_time,
+    status = roc_data$roc_event,
+    marker = 1 - roc_data$pred_rsf_prob,
+    predict.time = 60,
+    method = "NNE",
+    span = 0.25 * nrow(roc_data)^(-0.20)
+  )
+  surv_roc_gbm <- survivalROC(
+    Stime = roc_data$roc_time,
+    status = roc_data$roc_event,
+    marker = 1 - roc_data$pred_gbm_prob,
+    predict.time = 60,
+    method = "NNE",
+    span = 0.25 * nrow(roc_data)^(-0.20)
+  )
+  auc_table <- data.frame(
+    Model = c("CoxPH", "RSF", "GBM"),
+    AUC_60months = c(surv_roc_cox$AUC, surv_roc_rsf$AUC, surv_roc_gbm$AUC)
+  )
+  print(auc_table)
+  plot(surv_roc_cox$FP, surv_roc_cox$TP, 
+       type = "l", col = "blue", lwd = 2,
+       xlab = "1 - Specificity", ylab = "Sensitivity",
+       main = "Time-dependent ROC at 60 months",
+       xlim = c(0, 1), ylim = c(0, 1))
+  lines(surv_roc_rsf$FP, surv_roc_rsf$TP, col = "red", lwd = 2)
+  lines(surv_roc_gbm$FP, surv_roc_gbm$TP, col = "green", lwd = 2)
+  abline(0, 1, lty = 2, col = "gray")
+   legend("bottomright", 
+         legend = c(
+           paste0("CoxPH (AUC=", round(surv_roc_cox$AUC, 3), ")"),
+           paste0("RSF (AUC=", round(surv_roc_rsf$AUC, 3), ")"),
+           paste0("GBM (AUC=", round(surv_roc_gbm$AUC, 3), ")")
+         ),
+         col = c("blue", "red", "green"), 
+         lwd = 2,
+         bty = "n")
+}
+# SUMMARY TABLE
+if(exists("auc_table")) {
+  final_comparison <- data.frame(
+    Model = c("CoxPH", "RSF", "GBM"),
+    C_Index = round(cindex_table$CIndex, 4),
+    AUC_60mo = round(auc_table$AUC_60months, 4)
+  )
+} else {
+  final_comparison <- data.frame(
+    Model = c("CoxPH", "RSF", "GBM"),
+    C_Index = round(cindex_table$CIndex, 4),
+    AUC_60mo = c(NA, NA, NA)
+  )
+}
+print(final_comparison)
+best_cindex <- final_comparison$Model[which.max(final_comparison$C_Index)]
+best_auc <- final_comparison$Model[which.max(final_comparison$AUC_60mo)]
+if(best_cindex == best_auc) {
+  print(paste(best_cindex, "is the optimal model for censoring adjustment."))
+} else {
+  print("RSF is recommended for censoring adjustment.")
+}
+```
+
+
+## RSF CENSORING ADJUSTMENT
+
+```{r 20}
+# Convert character columns to factors before RSF
+DHS_model <- DHS_model %>%
+  mutate(across(where(is.character), as.factor))
+# Ensure DHS categorical variables are properly encoded
+DHS_model$v025 <- as.factor(DHS_model$v025)
+DHS_model$v190 <- as.factor(DHS_model$v190)
+DHS_model$b4 <- as.factor(DHS_model$b4)
+DHS_model$b0 <- as.factor(DHS_model$b0)
+```
+
+Corrected RSF-based censoring adjustment for under-five mortality
+
+This section implements a Random Survival Forest (RSF)-based censoring correction framework to address under-five mortality underestimation in DHS-type survey data.
+
+The key challenge in standard DHS survival analysis is that children who are alive at survey time but have not yet reached age five (60 months) are treated as fully censored observations. This may lead to biased under-five mortality estimates because some of these children may still die before reaching age five.
+
+To address this limitation, an RSF model is used to estimate individual-level conditional mortality risk between current age and 60 months. The approach explicitly:
+
+Uses observed survival times (b7) for deaths
+Applies censoring at 60 months for children who survive beyond the under-five threshold
+Incorporates age at survey (b19) to distinguish partial exposure time
+Avoids data leakage by excluding post-outcome information from predictors
+
+The RSF model is trained on a combined survival outcome (time, event) and used to estimate survival probabilities at both current age and age 60 months. The difference between these survival probabilities is used to compute conditional risk of dying before age five.
+
+This enables:
+
+Estimation of unobserved future deaths among censored children
+Calculation of expected additional under-five deaths
+Adjustment of overall under-five mortality rate (U5MR)
+Bootstrap-based uncertainty quantification
+
+The final output includes:
+
+Observed U5MR
+Expected (adjusted) U5MR
+95% bootstrap confidence intervals
+Age-specific mortality risk distribution
+Individual-level predicted death probabilities
+
+This approach improves standard survival analysis by explicitly modeling post-survey mortality risk among censored children, which is essential for small-area and spatial mortality estimation frameworks such as INLA-SPDE.
+
+```{r 21}
+# CORRECTED RSF CENSORING ADJUSTMENT - ETHIOPIA 2000
+# CLEAN VERSION (NO WEIGHTS)
+# PREPARE SURVIVAL DATA (NO LEAKAGE)
+DHS_model <- DHS_model %>%
+  mutate(
+    time = case_when(
+      b5 == 1 ~ b7,
+      b5 == 0 & b19 >= 60 ~ 60,
+      b5 == 0 & b19 < 60 ~ b19,
+      TRUE ~ NA_real_
+    ),
+    event = case_when(
+      b5 == 1 & b7 < 60 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  filter(!is.na(time), !is.na(event))
+# DEFINE PREDICTORS (EXCLUDE b19)
+predictors <- c("v025", "v190", "b4", "b0", "ndvi", 
+                "ethiopia_5km_slop_zscore.tif.tif", "deareaha", 
+                "dewpoint", "dpt3", "education", "ethiopia_5km_lri",  
+                "ethiopia_5km_stunting", "hiv", "malaria", "nightlights",
+                "pm2_5", "potential_evaporation", "runoff", 
+                "severe_wasting", "solar_radiation", "wash", "water")
+
+existing_predictors <- predictors[predictors %in% names(DHS_model)]
+
+# FIT RSF MODEL
+
+set.seed(123)
+
+rsf_model <- rfsrc(
+  Surv(time, event) ~ .,
+  data = DHS_model[, c("time", "event", existing_predictors)],
+  ntree = 500,
+  importance = TRUE,
+  nodesize = 15,
+  bootstrap = "by.root"
+)
+# IDENTIFY CENSORED CHILDREN
+censored_children <- DHS_model %>% 
+  filter(b19 < 60 & b5 == 0)
+# PREDICT SURVIVAL AND COMPUTE RISK
+if(nrow(censored_children) > 0) {
+  rsf_pred <- predict(rsf_model, newdata = censored_children)
+  time_points <- rsf_pred$time.interest
+  surv_to_60 <- numeric(nrow(censored_children))
+  surv_to_current <- numeric(nrow(censored_children))
+  for(i in 1:nrow(censored_children)) {
+    current_age <- censored_children$b19[i]
+    surv_to_current[i] <- approx(
+      time_points,
+      rsf_pred$survival[i, ],
+      xout = current_age,
+      rule = 2,
+      ties = "ordered"
+    )$y
+    surv_to_60[i] <- approx(
+      time_points,
+      rsf_pred$survival[i, ],
+      xout = 60,
+      rule = 2,
+      ties = "ordered"
+    )$y
+  }
+  # Conditional risk
+  conditional_risk <- (surv_to_current - surv_to_60) / surv_to_current
+  # Clean values
+  conditional_risk[is.na(conditional_risk)] <- 0
+  conditional_risk[conditional_risk < 0] <- 0
+  conditional_risk[conditional_risk > 1] <- 1
+  # Newborn correction
+  idx_newborn <- which(censored_children$b19 == 0)
+  if(length(idx_newborn) > 0) {
+    conditional_risk[idx_newborn] <- 1 - surv_to_60[idx_newborn]
+  }
+  # Store predictions
+  censored_children$pred_risk <- conditional_risk
+   # EXPECTED DEATHS
+  expected_additional_deaths <- sum(censored_children$pred_risk, na.rm = TRUE)
+  known_deaths <- sum(DHS_model$b5 == 1 & DHS_model$b7 < 60, na.rm = TRUE)
+  total_expected_deaths <- known_deaths + expected_additional_deaths
+   total_children <- nrow(DHS_model)
+  observed_u5mr <- 1000 * known_deaths / total_children
+  expected_u5mr <- 1000 * total_expected_deaths / total_children
+  # BOOTSTRAP
+  set.seed(123)
+  n_boot <- 100
+  boot_results <- numeric(n_boot)
+  for(b in 1:n_boot) {
+    boot_idx <- sample(1:nrow(censored_children), replace = TRUE)
+    boot_sample <- censored_children[boot_idx, ]
+    boot_expected <- sum(boot_sample$pred_risk, na.rm = TRUE)
+    boot_results[b] <- 1000 * (known_deaths + boot_expected) / total_children
+  }
+  ci <- quantile(boot_results, c(0.025, 0.975), na.rm = TRUE)
+  # AGE-SPECIFIC RESULTS
+  age_breakdown <- censored_children %>%
+    mutate(age_group = case_when(
+      b19 < 12 ~ "0-11 months",
+      b19 < 24 ~ "12-23 months",
+      b19 < 36 ~ "24-35 months",
+      b19 < 48 ~ "36-47 months",
+      TRUE ~ "48-59 months"
+    )) %>%
+    group_by(age_group) %>%
+    summarise(
+      N = n(),
+      Mean_Risk = round(mean(pred_risk, na.rm = TRUE), 4),
+      Expected_Deaths = round(sum(pred_risk, na.rm = TRUE), 1),
+      .groups = "drop"
+    )
+   # MERGE PREDICTIONS BACK
+   DHS_model$pred_risk <- NA
+  DHS_model$pred_risk[DHS_model$b19 < 60 & DHS_model$b5 == 0] <- censored_children$pred_risk
+   # GENERATE BINARY OUTCOME (SIMULATION)
+   set.seed(123)
+    DHS_model$death_predicted <- NA
+    DHS_model$death_predicted[DHS_model$b5 == 1 & DHS_model$b7 < 60] <- 1
+  DHS_model$death_predicted[DHS_model$b19 >= 60 & DHS_model$b5 == 0] <- 0
+  
+  censored_idx <- which(DHS_model$b19 < 60 & DHS_model$b5 == 0)
+  
+  DHS_model$death_predicted[censored_idx] <- rbinom(
+    n = length(censored_idx),
+    size = 1,
+    prob = DHS_model$pred_risk[censored_idx]
+  )
+    # FINAL OUTPUT
+  print(observed_u5mr)
+  print(expected_u5mr)
+  print(ci)
+  print(age_breakdown)
+  table(DHS_model$death_predicted)
+}
+```
+
+```{r 22}
+DHS_model<-select(DHS_model, b5, b19, b7, v025, v190, b4, b0, death_predicted, time, event, pred_risk)
+DHS_final<-cbind(DHS_model, location)
+saveRDS(DHS_final, "DHS for INLA/DHS_2000.rds")
+```
+
+
